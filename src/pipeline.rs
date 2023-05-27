@@ -5,13 +5,14 @@ use bevy::{
     render::{
         render_asset::RenderAssets,
         render_graph::{Node, NodeRunError, RenderGraph, RenderGraphContext, SlotInfo},
-        render_resource::{encase::private::WriteInto, *},
+        render_resource::*,
         renderer::{RenderContext, RenderDevice, RenderQueue},
+        texture::FallbackImage,
         RenderApp, RenderSet,
     },
 };
 
-use crate::{ShaderImage, ShaderParams, WORKGROUP_SIZE};
+use crate::{MainBindGroup, ShaderParams, ToByteBuff, WORKGROUP_SIZE};
 
 pub(crate) struct ShaderPipelinePlugin;
 impl Plugin for ShaderPipelinePlugin {
@@ -27,9 +28,7 @@ impl Plugin for ShaderPipelinePlugin {
 
         render_app
             .init_resource::<ShaderPipeline>()
-            .insert_resource(ParamsBuff(buffer))
-            .add_system(prepare_params::<ShaderParams, ParamsBuff>.in_set(RenderSet::Prepare))
-            //.add_system(prepare_params::<ShaderParams, ParamsBuff>.in_set(RenderSet::Prepare))
+            .init_resource::<FallbackImage>()
             .add_system(queue_bind_group.in_set(RenderSet::Queue));
         let mut render_graph = render_app.world.resource_mut::<RenderGraph>();
         render_graph.add_node("compute_shader", ShaderNode::default());
@@ -49,47 +48,12 @@ pub(crate) struct ShaderPipeline {
 
 impl FromWorld for ShaderPipeline {
     fn from_world(world: &mut World) -> Self {
-        let bind_group_layout =
-            world
-                .resource::<RenderDevice>()
-                .create_bind_group_layout(&BindGroupLayoutDescriptor {
-                    label: Some("Shader Playground Bind Group Layout"),
-                    entries: &[
-                        BindGroupLayoutEntry {
-                            binding: 0,
-                            visibility: ShaderStages::COMPUTE,
-                            ty: BindingType::StorageTexture {
-                                access: StorageTextureAccess::ReadWrite,
-                                format: TextureFormat::Rgba8Unorm,
-                                view_dimension: TextureViewDimension::D2,
-                            },
-                            count: None,
-                        },
-                        BindGroupLayoutEntry {
-                            binding: 1,
-                            visibility: ShaderStages::COMPUTE,
-                            ty: BindingType::Buffer {
-                                ty: BufferBindingType::Uniform,
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        BindGroupLayoutEntry {
-                            binding: 2,
-                            visibility: ShaderStages::COMPUTE,
-                            ty: BindingType::Buffer {
-                                ty: BufferBindingType::Storage { read_only: false },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                    ],
-                });
+        let bind_group_layout = MainBindGroup::bind_group_layout(world.resource::<RenderDevice>());
 
         let pipeline_cache = world.resource::<PipelineCache>();
+
         let shader = world.resource::<AssetServer>().load("shaders/compute.wgsl");
+
         let init_pipeline = pipeline_cache.queue_compute_pipeline(compute_descriptor(
             &bind_group_layout,
             "init",
@@ -126,52 +90,22 @@ fn compute_descriptor(
 }
 
 #[derive(Resource)]
-struct ShaderBindGroup(pub BindGroup);
-
-#[derive(Resource, Deref, DerefMut)]
-struct ParamsBuff(Buffer);
-
-#[derive(Resource, Deref, DerefMut)]
-struct ParticleDataBuff(Buffer);
-
-fn prepare_params<
-    T: ShaderType + WriteInto + Resource,
-    D: std::ops::Deref<Target = Buffer> + Resource,
->(
-    source: Res<T>,
-    dest: Res<D>,
-    render_queue: Res<RenderQueue>,
-) {
-    ShaderParams::assert_uniform_compat();
-    let mut buffer = encase::UniformBuffer::new(Vec::new());
-    buffer.write::<T>(&source).unwrap();
-
-    render_queue.write_buffer(&*dest, 0, buffer.as_ref().as_slice());
-}
+struct ShaderBindGroup(pub PreparedBindGroup<()>);
 
 fn queue_bind_group(
     mut commands: Commands,
     render_device: Res<RenderDevice>,
     pipeline: Res<ShaderPipeline>,
     gpu_images: Res<RenderAssets<Image>>,
-    shader_image: Res<ShaderImage>,
-    config: ResMut<ParamsBuff>,
+    fallback_image: Res<FallbackImage>,
+    main_bindgroup: Res<MainBindGroup>,
 ) {
-    let view = &gpu_images[&shader_image.0];
-    let bind_group = render_device.create_bind_group(&BindGroupDescriptor {
-        label: Some("Shader Playground Bind Group"),
-        layout: &pipeline.bind_group_layout,
-        entries: &[
-            BindGroupEntry {
-                binding: 0,
-                resource: BindingResource::TextureView(&view.texture_view),
-            },
-            BindGroupEntry {
-                binding: 1,
-                resource: config.as_entire_binding(),
-            },
-        ],
-    });
+    let Ok(bind_group) = main_bindgroup.as_bind_group(
+        &pipeline.bind_group_layout,
+        &render_device,
+        &gpu_images,
+        &fallback_image,
+    ) else { info!("bind group prepare failed"); return };
     commands.insert_resource(ShaderBindGroup(bind_group))
 }
 
@@ -216,16 +150,18 @@ impl Node for ShaderNode {
         render_context: &mut RenderContext,
         world: &World,
     ) -> Result<(), NodeRunError> {
-        let texture_bind_group = &world.resource::<ShaderBindGroup>().0;
+        let bind_group = &world.resource::<ShaderBindGroup>().0;
         let pipeline_cache = world.resource::<PipelineCache>();
         let pipeline = world.resource::<ShaderPipeline>();
-        let image = world.resource::<ShaderImage>();
-        let images = world.resource::<RenderAssets<Image>>();
-        let Some(image) = images.get(image) else {return Ok(());};
         let mut pass = render_context
             .command_encoder()
             .begin_compute_pass(&ComputePassDescriptor::default());
-        pass.set_bind_group(0, texture_bind_group, &[]);
+        pass.set_bind_group(0, &bind_group.bind_group, &[]);
+
+        let main_bg = world.resource::<MainBindGroup>();
+        let images = world.resource::<RenderAssets<Image>>();
+        let Some(image) = images.get(&main_bg.texture) else {return Ok(());};
+
         match self.state {
             ShaderState::Loading | ShaderState::Init => (),
             ShaderState::Update => {
