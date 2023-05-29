@@ -1,7 +1,7 @@
 #![doc = include_str!("../README.md")]
 use bevy::{prelude::*, window::WindowResolution};
 use bevy_screen_diagnostics::{ScreenDiagnosticsPlugin, ScreenFrameDiagnosticsPlugin};
-use newton_fractal::*;
+use compute_playground::*;
 
 const BACKGROUND_COLOR: Color = Color::BLACK;
 
